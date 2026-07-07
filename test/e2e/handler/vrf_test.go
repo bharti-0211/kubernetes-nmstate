@@ -96,6 +96,7 @@ var _ = Describe("NodeNetworkState", func() {
 			routeNextHopInterfaceWithTableID(node, destIPAddress, vrfID).Should(Equal(firstSecondaryNic))
 
 			restartNodeWithoutWaiting(node)
+			waitForNodeToStart(node)
 
 			By("Wait for policy re-reconciled after node reboot")
 			policy.WaitForPolicyTransitionUpdate(TestPolicy)

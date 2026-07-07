@@ -290,7 +290,28 @@ func vlanUpWithStaticIP(iface, ipAddress string) nmstate.State {
 
 func resetPrimaryAndSecondaryNICs() nmstate.State {
 	noAdditionalNICs := environment.GetVarWithDefault("ENV_WITH_ONLY_ONE_NIC", "FALSE")
-	if noAdditionalNICs == "FALSE" {
+	skipPrimaryNIC := environment.GetVarWithDefault("SKIP_PRIMARY_NIC_CONFIG", "FALSE")
+
+	if skipPrimaryNIC == "TRUE" {
+		// Primary NIC is part of OVS bridge, only configure secondary NICs
+		return nmstate.NewState(fmt.Sprintf(`interfaces:
+  - name: %s
+    type: ethernet
+    state: up
+    ipv4:
+      enabled: false
+    ipv6:
+      enabled: false
+  - name: %s
+    state: up
+    type: ethernet
+    ipv4:
+      enabled: false
+    ipv6:
+      enabled: false
+
+`, firstSecondaryNic, secondSecondaryNic))
+	} else if noAdditionalNICs == "FALSE" {
 		return nmstate.NewState(fmt.Sprintf(`interfaces:
   - name: %s
     type: ethernet
