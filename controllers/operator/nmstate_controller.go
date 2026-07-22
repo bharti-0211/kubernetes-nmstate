@@ -69,6 +69,9 @@ type NMStateReconciler struct {
 	IsOpenShift bool
 	deployments []client.ObjectKey
 	daemonSets  []client.ObjectKey
+	// tlsProfileWarning describes cluster TLS profile entries that cannot be
+	// honored; reported as a Degraded condition. Request-scoped.
+	tlsProfileWarning string
 }
 
 // Core resources: services, endpoints, events, configmaps need full CRUD for handler deployment manifests.
@@ -147,6 +150,7 @@ func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.deployments = []client.ObjectKey{}
 	r.daemonSets = []client.ObjectKey{}
+	r.tlsProfileWarning = ""
 
 	if err := r.applyManifests(instance, ctx); err != nil {
 		r.setDegradedCondition(ctx, instance, shared.NmstateInternalError, err.Error())
@@ -247,6 +251,7 @@ func (r *NMStateReconciler) applyNetworkPolicies(ctx context.Context, instance *
 	data.Data["HandlerNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "")
 	data.Data["OperatorNamespace"] = environment.GetEnvVar("OPERATOR_NAMESPACE", "")
 	data.Data["PluginNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "")
+	data.Data["MonitoringNamespace"] = environment.GetEnvVar("MONITORING_NAMESPACE", "")
 	data.Data["IsOpenShift"] = r.IsOpenShift
 
 	return r.renderAndApply(ctx, instance, data, "netpol", true)
@@ -413,6 +418,13 @@ func (r *NMStateReconciler) applyHandler(ctx context.Context, instance *nmstatev
 		if err != nil {
 			return fmt.Errorf("failed fetching TLS profile for ConfigMap: %w", err)
 		}
+		// Refuse to roll out a profile the components cannot honor; it
+		// would crash-loop the TLS-serving pods.
+		_, unsupported, err := nmstatetls.NewTLSConfigFromProfile(tlsProfileSpec)
+		if err != nil {
+			return fmt.Errorf("cluster TLS profile cannot be honored: %w", err)
+		}
+		r.tlsProfileWarning = unsupported.Message()
 		tlsJSON, err := json.Marshal(tlsProfileSpec)
 		if err != nil {
 			return fmt.Errorf("failed serializing TLS profile: %w", err)
@@ -626,20 +638,29 @@ func (r *NMStateReconciler) reconcileStatus(ctx context.Context, instance *nmsta
 			shared.NmstateSuccessfullyDeployed,
 			"All components are available and ready",
 		)
-		// Clear any previous degraded condition when available
-		instance.Status.Conditions.Set(
-			shared.NmstateConditionDegraded,
-			corev1.ConditionFalse,
-			shared.NmstateSuccessfullyDeployed,
-			"All components are available and ready",
-		)
+		if r.tlsProfileWarning != "" {
+			instance.Status.Conditions.Set(
+				shared.NmstateConditionDegraded,
+				corev1.ConditionTrue,
+				shared.NmstateTLSProfileNotFullyHonored,
+				r.tlsProfileWarning,
+			)
+		} else {
+			// Clear any previous degraded condition when available
+			instance.Status.Conditions.Set(
+				shared.NmstateConditionDegraded,
+				corev1.ConditionFalse,
+				shared.NmstateSuccessfullyDeployed,
+				"All components are available and ready",
+			)
+		}
 	}
 
 	// Clear managed fields before applying server-side apply to status subresource
 	instance.SetManagedFields(nil)
 
 	//nolint:staticcheck // TODO: migrate to SubResource("status").Apply()
-	return r.Client.Status().Patch(ctx, instance, client.Apply, nmstateOperatorFieldOwner)
+	return r.Client.Status().Patch(ctx, instance, client.Apply, nmstateOperatorFieldOwner, client.ForceOwnership)
 }
 
 func (r *NMStateReconciler) setDegradedCondition(
@@ -666,7 +687,19 @@ func (r *NMStateReconciler) setDegradedCondition(
 		reason,
 		message,
 	)
-	return r.Client.Status().Update(ctx, instance)
+
+	// Use SSA with ForceOwnership, consistent with reconcileStatus(), to
+	// prevent field manager conflicts that make the NMState CR unrecoverable.
+	instance.SetManagedFields(nil)
+	//nolint:staticcheck // TODO: migrate to SubResource("status").Apply()
+	if err := r.Client.Status().Patch(ctx, instance, client.Apply, nmstateOperatorFieldOwner, client.ForceOwnership); err != nil {
+		// Callers invoke this helper while already handling another error
+		// and ignore its return value, so log the failure here to keep it
+		// visible for troubleshooting.
+		r.Log.Error(err, "failed to set degraded condition on NMState CR status", "reason", reason)
+		return err
+	}
+	return nil
 }
 
 func (r *NMStateReconciler) renderAndApply(
